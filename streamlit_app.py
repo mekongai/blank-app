@@ -5,7 +5,6 @@ A security scanner for detecting Next.js middleware bypass vulnerability.
 This tool is intended for authorized security testing only.
 """
 
-import json
 import streamlit as st
 
 from cve_scanner import CVE202529927Scanner, Verdict

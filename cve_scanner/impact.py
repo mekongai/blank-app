@@ -5,11 +5,24 @@ Validates that the bypass actually provides access to protected content
 by looking for stable markers that indicate authenticated content.
 """
 
-import re
-from typing import Dict, List, Set, Tuple
+import logging
+from typing import Dict, List, Tuple
 from html.parser import HTMLParser
 
 from .models import ImpactResult, MarkerMatch, Confidence
+
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+# Threshold constants for impact validation
+MIN_MARKERS_HIGH_CONFIDENCE = 2      # Minimum markers for HIGH confidence
+MIN_STRUCTURAL_DIFF_MEDIUM = 10      # Structural diff for MEDIUM confidence
+MIN_STRUCTURAL_DIFF_LOW = 5          # Structural diff for LOW confidence
+MIN_CONTENT_LENGTH_DIFF = 5000       # Minimum content length diff (bytes)
+MIN_LOGIN_PAGE_SIGNALS = 2           # Minimum signals to detect login page
+MIN_ERROR_PAGE_SIGNALS = 2           # Minimum signals to detect error page
+API_RESPONSE_SIZE_MULTIPLIER = 2     # API response must be 2x larger
 
 
 # Stable markers that indicate authenticated/protected content
@@ -154,12 +167,25 @@ class DOMStructureParser(HTMLParser):
 
 
 def extract_dom_structure(html: str) -> List[str]:
-    """Extract simplified DOM structure from HTML."""
+    """
+    Extract simplified DOM structure from HTML.
+
+    Args:
+        html: HTML content to parse
+
+    Returns:
+        List of element signatures representing DOM structure
+    """
+    if not html or not html.strip():
+        return []
+
     try:
         parser = DOMStructureParser()
         parser.feed(html)
         return parser.get_structure()
-    except Exception:
+    except Exception as e:
+        # Log the error for debugging but don't fail
+        logger.debug(f"Failed to parse HTML structure: {type(e).__name__}: {e}")
         return []
 
 
@@ -167,24 +193,36 @@ def is_login_page(content: str) -> Tuple[bool, int]:
     """
     Check if content appears to be a login page.
 
+    Args:
+        content: Page content to analyze
+
     Returns:
         Tuple of (is_login, signal_count)
     """
+    if not content:
+        return False, 0
+
     content_lower = content.lower()
     signals = sum(1 for m in LOGIN_PAGE_MARKERS if m in content_lower)
-    return signals >= 2, signals
+    return signals >= MIN_LOGIN_PAGE_SIGNALS, signals
 
 
 def is_error_page(content: str) -> Tuple[bool, int]:
     """
     Check if content appears to be an error page.
 
+    Args:
+        content: Page content to analyze
+
     Returns:
         Tuple of (is_error, signal_count)
     """
+    if not content:
+        return False, 0
+
     content_lower = content.lower()
     signals = sum(1 for m in ERROR_PAGE_MARKERS if m in content_lower)
-    return signals >= 2, signals
+    return signals >= MIN_ERROR_PAGE_SIGNALS, signals
 
 
 def find_new_markers(
@@ -275,15 +313,8 @@ def validate_impact(
     # Check 3: Find auth-only markers in bypass that aren't in baseline
     new_markers = find_new_markers(bypass_content, baseline_content)
 
-    if len(new_markers) >= 3:
-        return ImpactResult(
-            is_real=True,
-            confidence=Confidence.HIGH,
-            reason=f"Found {len(new_markers)} auth-only markers",
-            markers_found=new_markers
-        )
-
-    if len(new_markers) == 2:
+    if len(new_markers) >= MIN_MARKERS_HIGH_CONFIDENCE:
+        # 2+ markers = HIGH confidence
         return ImpactResult(
             is_real=True,
             confidence=Confidence.HIGH,
@@ -292,6 +323,7 @@ def validate_impact(
         )
 
     if len(new_markers) == 1:
+        # Single marker = MEDIUM confidence
         return ImpactResult(
             is_real=True,
             confidence=Confidence.MEDIUM,
@@ -302,7 +334,7 @@ def validate_impact(
     # Check 4: Structural difference
     structural_diff = calculate_structural_diff(bypass_content, baseline_content)
 
-    if structural_diff > 10:
+    if structural_diff > MIN_STRUCTURAL_DIFF_MEDIUM:
         return ImpactResult(
             is_real=True,
             confidence=Confidence.MEDIUM,
@@ -310,7 +342,7 @@ def validate_impact(
             structural_diff_count=structural_diff
         )
 
-    if structural_diff > 5:
+    if structural_diff > MIN_STRUCTURAL_DIFF_LOW:
         return ImpactResult(
             is_real=True,
             confidence=Confidence.LOW,
@@ -320,7 +352,7 @@ def validate_impact(
 
     # Check 5: Content length difference (weak signal)
     len_diff = len(bypass_content) - len(baseline_content)
-    if len_diff > 5000:
+    if len_diff > MIN_CONTENT_LENGTH_DIFF:
         return ImpactResult(
             is_real=True,
             confidence=Confidence.LOW,
@@ -378,7 +410,7 @@ def validate_api_impact(
             )
 
         # Check for data exposure by length
-        if len(bypass_content) > len(baseline_content) * 2:
+        if len(bypass_content) > len(baseline_content) * API_RESPONSE_SIZE_MULTIPLIER:
             return ImpactResult(
                 is_real=True,
                 confidence=Confidence.LOW,
